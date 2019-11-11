@@ -8,8 +8,10 @@
 #include <algorithm>
 #include <stdio.h>
 
-constexpr auto TILE_SIZE = 16;
+/// Tile size used by the OptimizedMMKernel
+constexpr auto TILE_SIZE = 32;
 
+/// Naive matrix multiplication CUDA Kernel
 __global__ void NaiveMMKernel(float *a, float *b, float *c, int size)
 {
 	int xOut = blockDim.x * blockIdx.x + threadIdx.x;
@@ -27,22 +29,23 @@ __global__ void NaiveMMKernel(float *a, float *b, float *c, int size)
 	c[yOut * size + xOut] = outValue;
 }
 
+/// Shared memory matrix multiplication CUDA kernel
 __global__ void OptimizedMMKernel(float *a, float *b, float *c, int size)
 {
+	// Create shared matrices for rows of A and columns of B
 	__shared__ float sharedA[TILE_SIZE * TILE_SIZE];
 	__shared__ float sharedB[TILE_SIZE * TILE_SIZE];
-
-	// Load shared memory
-	// Each block loads a shared block from A and B so the partial sums can
-	// be done at the same time
 
 	int tx = threadIdx.x;
 	int ty = threadIdx.y;
 
-	int x = blockIdx.x * blockDim.x + threadIdx.x;
-	int y = blockIdx.y * blockDim.y + threadIdx.y;
+	int x = blockIdx.x * blockDim.x + tx;
+	int y = blockIdx.y * blockDim.y + ty;
 
 	float sum = 0;
+
+	// Divide the matrix up into tiles based on the tile size so each thread
+	// Can perform its partial sum of the dot product from the shared matrix
 	int tilesPerGrid = size / blockDim.x;
 	for (int i = 0; i < tilesPerGrid; i++)
 	{
@@ -55,16 +58,18 @@ __global__ void OptimizedMMKernel(float *a, float *b, float *c, int size)
 
 		for (int j = 0; j < TILE_SIZE; j++)
 		{
-			sum = sum + sharedA[ty * TILE_SIZE + j] * sharedB[j * TILE_SIZE + tx];
+			sum += sharedA[ty * TILE_SIZE + j] * sharedB[j * TILE_SIZE + tx];
 		}
 
 		// Wait for all threads to compute their partial sum from the shared matrices before loading the next
 		__syncthreads();
 	}
 
+	// Store the full sum as the result
 	c[y * size + x] = sum;
 }
 
+/// Prints a matrix out to the stderr stream
 void PrintMatrix(float *matrix, int width, int height)
 {
 	for (int i = 0; i < width * height; i++)
@@ -90,6 +95,7 @@ void PrintMatrix(float *matrix, int width, int height)
 	}
 }
 
+/// Checks a cuda call to make sure its OK
 void CheckCudaCall(cudaError_t callResult, const char *message)
 {
 	if (callResult != cudaSuccess)
@@ -98,7 +104,8 @@ void CheckCudaCall(cudaError_t callResult, const char *message)
 	}
 }
 
-float* NaiveMM(float *a, float *b, int size, float *kernelTime, float* totalTime)
+/// Calls the naive matrix multiplication kernel
+float* NaiveMM(float *a, float *b, int size, int tpb, float *kernelTime, float* totalTime)
 {
 	const int matrixSizeBytes = size * size * sizeof(float);
 	float *result = new float[size * size];
@@ -127,7 +134,6 @@ float* NaiveMM(float *a, float *b, int size, float *kernelTime, float* totalTime
 	cudaEventRecord(kernelStart, 0);
 
 	// Call kernel
-	const int tpb = 16;
 	dim3 blockSize(size / tpb, size / tpb);
 	dim3 threadsPerBlock(tpb, tpb);
 	NaiveMMKernel<<<blockSize, threadsPerBlock>>>(devA, devB, devC, size);
@@ -151,11 +157,16 @@ float* NaiveMM(float *a, float *b, int size, float *kernelTime, float* totalTime
 	cudaFree(devA);
 	cudaFree(devB);
 	cudaFree(devC);
+	cudaFree(kernelStart);
+	cudaFree(kernelStop);
+	cudaFree(totalStart);
+	cudaFree(totalStop);
 	
 	// Return result
 	return result;
 }
 
+/// Calls the optimized (shared memory) matrix multiplication kernel
 float* OptimizedMM(float *a, float *b, int size, float *kernelTime, float* totalTime)
 {
 	const int matrixSizeBytes = size * size * sizeof(float);
@@ -208,11 +219,16 @@ float* OptimizedMM(float *a, float *b, int size, float *kernelTime, float* total
 	cudaFree(devA);
 	cudaFree(devB);
 	cudaFree(devC);
+	cudaFree(kernelStart);
+	cudaFree(kernelStop);
+	cudaFree(totalStart);
+	cudaFree(totalStop);
 
 	// Return result
 	return result;
 }
 
+/// Calls the cublasSgemm function, to multiply 2 matrices
 float* CublasMM(cublasHandle_t &handle, float *a, float *b, int size, float *kernelTime, float* totalTime)
 {
 	const int matrixSizeBytes = size * size * sizeof(float);
@@ -269,11 +285,16 @@ float* CublasMM(cublasHandle_t &handle, float *a, float *b, int size, float *ker
 	cudaFree(devA);
 	cudaFree(devB);
 	cudaFree(devC);
+	cudaFree(kernelStart);
+	cudaFree(kernelStop);
+	cudaFree(totalStart);
+	cudaFree(totalStop);
 
 	// Return result
 	return result;
 }
 
+/// Ranomizes a matrix with random floats in the range [0, 5)
 void RandomizeMatrix(float *mat, int size)
 {
 	for (int i = 0; i < size * size; i++) 
@@ -283,7 +304,8 @@ void RandomizeMatrix(float *mat, int size)
 	}
 }
 
-void SetMatrixAsSequential(float *mat, int size)
+/// Sets a matrix's elements as 1..N for testing purposes
+void FillMatrixInOrder(float *mat, int size)
 {
 	for (int i = 0; i < size * size; i++) 
 	{
@@ -291,6 +313,7 @@ void SetMatrixAsSequential(float *mat, int size)
 	}
 }
 
+/// Calculates residual sum between a transposed cuBLAS matrix and a row-major ordered output matrix
 float MatrixResidual(float *cublas, float *test, int w, int h)
 {
 	float dif = 0;
@@ -306,6 +329,7 @@ float MatrixResidual(float *cublas, float *test, int w, int h)
 	return dif;
 }
 
+/// Tests all methods at a specified matrix size
 void TestSize(cublasHandle_t &handle, int size, bool writeOutput)
 {
 	float *testA = new float[size * size];
@@ -331,10 +355,11 @@ void TestSize(cublasHandle_t &handle, int size, bool writeOutput)
 	printf("Cublas MM | Total (ms) = %.3f | Kernel (ms) = %.3f\n", totalTime0, kernelTime0);
 
 	// Run Naive MM
+	const int threadsPerBlock = 32;
 	float totalTime1, kernelTime1;
-	float* result1 = NaiveMM(testA, testB, size, &kernelTime1, &totalTime1);
+	float* result1 = NaiveMM(testA, testB, size, threadsPerBlock, &kernelTime1, &totalTime1);
 	float residual1 = MatrixResidual(result0, result1, size, size);
-	printf("Naive MM | Total (ms) = %.3f | Kernel (ms) = %.3f | Cublas Residual = %.6f\n", totalTime1, kernelTime1, residual1);
+	printf("Naive MM (%i x %i t/b) | Total (ms) = %.3f | Kernel (ms) = %.3f | Cublas Residual = %.6f\n", threadsPerBlock, threadsPerBlock, totalTime1, kernelTime1, residual1);
 	if (writeOutput && naive_fp)
 	{
 		fprintf(naive_fp, "%i, %.3f, %.3f\n", size, totalTime1, kernelTime1);
@@ -344,10 +369,10 @@ void TestSize(cublasHandle_t &handle, int size, bool writeOutput)
 	float totalTime2, kernelTime2;
 	float* result2 = OptimizedMM(testA, testB, size, &kernelTime2, &totalTime2);
 	float residual2 = MatrixResidual(result0, result2, size, size);
-	printf("Optimized MM | Total (ms) = %.3f | Kernel (ms) = %.3f | Cublas Residual = %.6f\n", totalTime2, kernelTime2, residual2);
+	printf("Optimized MM (%i x %i t/b) | Total (ms) = %.3f | Kernel (ms) = %.3f | Cublas Residual = %.6f\n", TILE_SIZE, TILE_SIZE, totalTime2, kernelTime2, residual2);
 	if (writeOutput && opt_fp)
 	{
-		fprintf(opt_fp, "%i, %.3f, %.3f\n", size, totalTime1, kernelTime1);
+		fprintf(opt_fp, "%i, %.3f, %.3f\n", size, totalTime2, kernelTime2);
 	}
 
 	// Delete input matrices
@@ -371,6 +396,7 @@ void TestSize(cublasHandle_t &handle, int size, bool writeOutput)
 	}
 }
 
+/// Program entry point
 int main()
 {
 	srand(0);
@@ -382,7 +408,8 @@ int main()
 	int sizes[8]{ 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
 	for (int i = 0; i < 8; i++)
 	{
-		TestSize(handle, sizes[i], true);
+		TestSize(handle, sizes[i], false);
+		printf("\n");
 	}
 
 	// Destroy the cublas handle
